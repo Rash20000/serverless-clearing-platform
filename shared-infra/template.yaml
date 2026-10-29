@@ -165,28 +165,9 @@ Resources:
         Environment: !Ref Environment
         ManagedBy: CloudFormation
 
-  # ── Custom Resource Helper Layer ──
-  CrHelperLayer:
-    Type: AWS::Serverless::LayerVersion
-    Properties:
-      LayerName: !Sub "${Environment}-crhelper-layer"
-      Description: CloudFormation Custom Resource Helper (crhelper) library
-      ContentUri: layers/crhelper/
-      CompatibleRuntimes:
-        - python3.12
-      CompatibleArchitectures:
-        - arm64
 
-  CrHelperLayerParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${Environment}/shared-infra/CrHelperLayerArn"
-      Type: String
-      Value: !Ref CrHelperLayer
-      Description: ARN of crhelper Lambda Layer
-      Tags:
-        Environment: !Ref Environment
-        ManagedBy: CloudFormation
+
+
 
 
 
@@ -265,10 +246,6 @@ Outputs:
     Export:
       Name: !Sub "${Environment}-PowertoolsLayerArn"
 
-  CrHelperLayerArn:
-    Description: ARN of crhelper Lambda Layer
-    Value: !Ref CrHelperLayer
-    Export:
-      Name: !Sub "${Environment}-CrHelperLayerArn"
+
 
 
