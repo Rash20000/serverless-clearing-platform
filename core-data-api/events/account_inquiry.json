@@ -1,0 +1,22 @@
+{
+  "resource": "/v1/account/inquiry",
+  "path": "/v1/account/inquiry",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "queryStringParameters": null,
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourcePath": "/v1/account/inquiry",
+    "httpMethod": "POST",
+    "stage": "dev",
+    "requestId": "c6af9ac6-7b61-11e6-9a41-97e81d29ccd5",
+    "identity": {
+      "sourceIp": "127.0.0.1"
+    }
+  },
+  "body": "{\"account_id\": \"ACC1234567\", \"fetch_activity\": true}",
+  "isBase64Encoded": false
+}

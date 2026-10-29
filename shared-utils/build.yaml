@@ -1,0 +1,56 @@
+version: 0.2
+
+env:
+  variables:
+    SAM_BUCKET: ""          # Set via CodeBuild project or pipeline
+    STACK_NAME: "shared-utils"
+    AWS_REGION: "us-east-1"
+    ENVIRONMENT: "dev"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.12"
+    commands:
+      - echo "Installing build tools..."
+      - pip install --upgrade pip
+      - pip install aws-sam-cli pytest boto3 aws-lambda-powertools
+
+  pre_build:
+    commands:
+      - echo "Running unit tests..."
+      - python -m unittest discover tests -v
+      - echo "Linting..."
+      - pip install ruff 2>/dev/null && ruff check src/ || true
+
+  build:
+    commands:
+      - echo "Building SAM template..."
+      - sam build --template-file template.yaml --use-container --parallel
+
+  post_build:
+    commands:
+      - echo "Packaging and deploying Custom Resources stack..."
+      - |
+        sam package \
+          --template-file .aws-sam/build/template.yaml \
+          --s3-bucket "${SAM_BUCKET}" \
+          --s3-prefix "${STACK_NAME}" \
+          --output-template-file packaged.yaml \
+          --region "${AWS_REGION}"
+      - |
+        sam deploy \
+          --template-file packaged.yaml \
+          --stack-name "${STACK_NAME}-${ENVIRONMENT}" \
+          --capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+          --parameter-overrides "Environment=${ENVIRONMENT}" \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset \
+          --region "${AWS_REGION}"
+      - echo "Shared Utils deploy complete."
+
+artifacts:
+  type: zip
+  files:
+    - packaged.yaml
+    - template.yaml

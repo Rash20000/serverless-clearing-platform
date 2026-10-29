@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Lambda Infrastructure Layers Stack.
+  Centrally builds, manages, and exports organization-wide AWS Lambda Layers:
+  1. Pandas Layer: pandas, numpy, and pytz for analytical and tabular processing.
+  2. OpenPyXL Layer: openpyxl and et_xmlfile for Excel spreadsheet parsing and report generation.
+  3. CrHelper Layer: CloudFormation Custom Resource Helper (crhelper) framework.
+  Publishes Layer ARNs to AWS SSM Parameter Store and CloudFormation Exports for cross-stack resolution.
+
+# ─────────────────────────────────────────────
+#  Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+    Description: Target deployment environment tier.
+
+# ─────────────────────────────────────────────
+#  Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── Layer 1: Pandas & NumPy ──
+  PandasLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${Environment}-pandas-layer"
+      Description: Pandas, NumPy, and date utilities for serverless data pipelines (Python 3.12 / ARM64)
+      ContentUri: layers/pandas/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      RetentionPolicy: Retain
+
+  PandasLayerParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/lambda-layers/pandas-arn"
+      Type: String
+      Value: !Ref PandasLayer
+      Description: ARN of the shared Pandas & NumPy Lambda Layer
+      Tags:
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+        Service: lambda-infra-layer
+
+  # ── Layer 2: OpenPyXL ──
+  OpenPyXLLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${Environment}-openpyxl-layer"
+      Description: OpenPyXL Excel processing library for automated spreadsheet generation (Python 3.12 / ARM64)
+      ContentUri: layers/openpyxl/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      RetentionPolicy: Retain
+
+  OpenPyXLLayerParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/lambda-layers/openpyxl-arn"
+      Type: String
+      Value: !Ref OpenPyXLLayer
+      Description: ARN of the shared OpenPyXL Lambda Layer
+      Tags:
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+        Service: lambda-infra-layer
+
+  # ── Layer 3: CloudFormation Custom Resource Helper (crhelper) ──
+  CrHelperLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${Environment}-crhelper-layer"
+      Description: CloudFormation Custom Resource Helper (crhelper) framework (Python 3.12 / ARM64)
+      ContentUri: layers/crhelper/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      RetentionPolicy: Retain
+
+  CrHelperLayerParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/lambda-layers/crhelper-arn"
+      Type: String
+      Value: !Ref CrHelperLayer
+      Description: ARN of the CloudFormation Custom Resource Helper (crhelper) Lambda Layer
+      Tags:
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+        Service: lambda-infra-layer
+
+# ─────────────────────────────────────────────
+#  Outputs & Exports
+# ─────────────────────────────────────────────
+Outputs:
+  PandasLayerArn:
+    Description: ARN of the Pandas & NumPy Lambda Layer
+    Value: !Ref PandasLayer
+    Export:
+      Name: !Sub "${Environment}-PandasLayerArn"
+
+  OpenPyXLLayerArn:
+    Description: ARN of the OpenPyXL Lambda Layer
+    Value: !Ref OpenPyXLLayer
+    Export:
+      Name: !Sub "${Environment}-OpenPyXLLayerArn"
+
+  CrHelperLayerArn:
+    Description: ARN of the CrHelper Lambda Layer
+    Value: !Ref CrHelperLayer
+    Export:
+      Name: !Sub "${Environment}-CrHelperLayerArn"

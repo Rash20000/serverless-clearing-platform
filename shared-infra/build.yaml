@@ -1,0 +1,45 @@
+version: 0.2
+
+env:
+  variables:
+    STACK_NAME: "shared-infra"
+    AWS_REGION: "us-east-1"
+    ENVIRONMENT: "dev"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.12"
+    commands:
+      - echo "Installing build tools..."
+      - pip install --upgrade pip
+      - pip install aws-sam-cli
+
+  pre_build:
+    commands:
+      - echo "Running template validation tests..."
+      - python -m unittest discover tests -v
+
+  build:
+    commands:
+      - echo "Validating CloudFormation template..."
+      - sam validate --template-file template.yaml
+
+  post_build:
+    commands:
+      - echo "Deploying Shared Infrastructure..."
+      - |
+        sam deploy \
+          --template-file template.yaml \
+          --stack-name "${ENVIRONMENT}-${STACK_NAME}" \
+          --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+          --parameter-overrides "Environment=${ENVIRONMENT}" \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset \
+          --region "${AWS_REGION}"
+      - echo "Shared Infrastructure deploy complete."
+
+artifacts:
+  type: zip
+  files:
+    - template.yaml

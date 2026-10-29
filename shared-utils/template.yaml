@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Shared Utilities Stack.
+  Hosts organization-wide CloudFormation Custom Resources:
+  1. StreamArnFetcher: Dynamically resolves LatestStreamArn for DynamoDB tables at deploy time.
+  2. EmptyBucket: Purges all objects, versions, and delete markers from an S3 bucket prior to deletion.
+  Includes operational CloudWatch alarms and least-privilege IAM policies.
+
+# ─────────────────────────────────────────────
+#  Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+
+# ─────────────────────────────────────────────
+#  Globals
+# ─────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 256
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: shared-utils
+        POWERTOOLS_LOG_LEVEL: INFO
+        LOG_LEVEL: INFO
+        ENVIRONMENT: !Ref Environment
+    Layers:
+      - !ImportValue !Sub "${Environment}-PowertoolsLayerArn"
+      - '{{resolve:ssm:CrHelperLayerArn}}'
+
+# ─────────────────────────────────────────────
+#  Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── Custom Resource 1: StreamArnFetcher ──
+  StreamArnFetcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-stream-arn-fetcher"
+      Handler: stream_arn_fetcher.lambda_handler
+      CodeUri: src/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeTable
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/*"
+      Tags:
+        Environment: !Ref Environment
+        Service: shared-utils
+
+  # ── Custom Resource 2: EmptyBucket ──
+  EmptyBucketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-empty-bucket"
+      Handler: empty_bucket.lambda_handler
+      CodeUri: src/
+      Timeout: 300
+      MemorySize: 512
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !Sub "arn:aws:s3:::*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource: !Sub "arn:aws:s3:::*/*"
+      Tags:
+        Environment: !Ref Environment
+        Service: shared-utils
+
+  # ── Operational CloudWatch Alarms ──
+  StreamArnFetcherErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-stream-arn-fetcher-errors"
+      AlarmDescription: "Alert when StreamArnFetcher encounters Custom Resource execution errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StreamArnFetcherFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  EmptyBucketErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-empty-bucket-errors"
+      AlarmDescription: "Alert when EmptyBucket encounters Custom Resource execution errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmptyBucketFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+#  Outputs & Exports
+# ─────────────────────────────────────────────
+Outputs:
+  StreamArnFetcherServiceToken:
+    Description: Service Token ARN for Custom::StreamArnFetcher
+    Value: !GetAtt StreamArnFetcherFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-StreamArnFetcherServiceToken"
+
+  EmptyBucketServiceToken:
+    Description: Service Token ARN for Custom::EmptyBucket
+    Value: !GetAtt EmptyBucketFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-EmptyBucketServiceToken"

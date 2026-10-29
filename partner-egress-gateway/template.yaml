@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Outbound Financial Market Data Egress Gateway.
+  High-performance, observable outbound egress façade using AWS Lambda Powertools APIGatewayRestResolver.
+  Dispatches outbound REST queries to financial data providers (Primary Exchange, Secondary Exchange, Reference Vendor)
+  with connection pooling, Secrets Manager credential caching, and SSM parameter endpoints.
+
+# ─────────────────────────────────────────────
+#  Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+    Description: Deployment environment.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: Memory allocation for Lambda functions (MB).
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda execution timeout in seconds.
+
+# ─────────────────────────────────────────────
+#  Globals
+# ─────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: !Ref LambdaMemorySize
+    Timeout: !Ref LambdaTimeout
+    Architectures:
+      - arm64
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_SERVICE_NAME: partner-egress-gateway
+        POWERTOOLS_LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_METRICS_NAMESPACE: OutboundGateway
+        PRIMARY_EXCHANGE_BASE_URL: !Sub "https://${Environment}.api.exchange-primary.example.com/api"
+        SECONDARY_EXCHANGE_BASE_URL: !Sub "https://${Environment}.api.exchange-secondary.example.com/api"
+        REF_VENDOR_BASE_URL: !Sub "https://${Environment}.api.reference-vendor.example.com/v1"
+    Layers:
+      - !ImportValue !Sub "${Environment}-PowertoolsLayerArn"
+
+# ─────────────────────────────────────────────
+#  Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ════════════════════════════════════════════
+  #  Outbound API Gateway (REST Façade)
+  # ════════════════════════════════════════════
+  OutboundApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${Environment}-partner-egress-gateway"
+      StageName: !Ref Environment
+      Description: Centralised outbound financial market data egress façade
+      TracingEnabled: true
+      EndpointConfiguration:
+        Type: REGIONAL
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: INFO
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 1000
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+        Format: |
+          {
+            "requestId": "$context.requestId",
+            "ip": "$context.identity.sourceIp",
+            "caller": "$context.identity.caller",
+            "user": "$context.identity.user",
+            "requestTime": "$context.requestTime",
+            "httpMethod": "$context.httpMethod",
+            "resourcePath": "$context.resourcePath",
+            "status": "$context.status",
+            "protocol": "$context.protocol",
+            "responseLength": "$context.responseLength",
+            "integrationLatency": "$context.integrationLatency",
+            "responseLatency": "$context.responseLatency"
+          }
+
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/partner-egress-gateway-${Environment}"
+      RetentionInDays: 90
+
+  # ════════════════════════════════════════════
+  #  Egress Gateway Lambda Function
+  # ════════════════════════════════════════════
+  EgressGatewayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-partner-egress-gateway"
+      Handler: egress_service.lambda_handler
+      CodeUri: src/
+      Description: Dispatches outbound HTTPS requests to financial market data vendors via Powertools APIGatewayRestResolver.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/egress/market-data/*"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/egress/market-data/*"
+      Events:
+        MarketDataProxy:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OutboundApiGateway
+            Path: /market-data/{proxy+}
+            Method: ANY
+        WarmupSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(*/5 13-20 ? * MON-FRI *)
+            Input: '{"action":"warmup","source":"aws.events"}'
+      Tags:
+        Environment: !Ref Environment
+        Service: partner-egress-gateway
+
+  # ════════════════════════════════════════════
+  #  Operational CloudWatch Alarms
+  # ════════════════════════════════════════════
+  ApiGateway5XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-partner-egress-5xx-errors"
+      AlarmDescription: "Alert when outbound egress gateway encounters 5XX API Gateway errors"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${Environment}-partner-egress-gateway"
+        - Name: Stage
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  EgressFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-partner-egress-function-errors"
+      AlarmDescription: "Alert when EgressGatewayFunction encounters execution errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EgressGatewayFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+#  Outputs
+# ─────────────────────────────────────────────
+Outputs:
+  OutboundApiGatewayEndpoint:
+    Description: Base URL of the Outbound Partner Egress API Gateway
+    Value: !Sub "https://${OutboundApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: OutboundApiGatewayExecuteEndpointUrl
+
+  OutboundApiGatewayRestApiId:
+    Description: REST API ID for cross-stack references
+    Value: !Ref OutboundApiGateway
+    Export:
+      Name: !Sub "${Environment}-OutboundApiGatewayRestApiId"
+
+  EgressGatewayFunctionArn:
+    Description: ARN of the Egress Gateway Lambda Function
+    Value: !GetAtt EgressGatewayFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-EgressGatewayFunctionArn"

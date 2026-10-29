@@ -1,0 +1,78 @@
+# build.yaml – CI/CD pipeline definition for core-data-api
+# Designed for AWS CodePipeline / CodeBuild or any YAML-driven CI system.
+
+version: "0.2"
+
+env:
+  parameter-store:
+    CACHE_ACCOUNT_TABLE: /core-data-api/cache/account-table-name
+    CACHE_ACTIVITY_TABLE: /core-data-api/cache/activity-table-name
+    CACHE_PAGES_TABLE: /core-data-api/cache/pages-table-name
+  variables:
+    SAM_BUCKET: "deployment-artifacts-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+    STACK_NAME: "core-data-api"
+    ENVIRONMENT: "dev"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.12"
+    commands:
+      - echo "Installing dependencies..."
+      - pip install --upgrade pip
+      - pip install aws-sam-cli
+      - pip install -r requirements-dev.txt 2>/dev/null || true
+
+  pre_build:
+    commands:
+      - echo "Running linters and static analysis..."
+      - python -m py_compile src/utils.py
+      - python -m py_compile src/router_service.py
+      - python -m py_compile src/account_service.py
+      - python -m py_compile src/activity_service.py
+      - python -m py_compile src/pages_service.py
+      - echo "Running unit tests..."
+      - python -m unittest discover tests
+
+  build:
+    commands:
+      - echo "Building SAM application..."
+      - sam validate --lint
+      - >
+        sam build
+        --template-file template.yaml
+        --use-container
+        --build-dir .aws-sam/build
+
+  post_build:
+    commands:
+      - echo "Packaging SAM application..."
+      - >
+        sam package
+        --template-file .aws-sam/build/template.yaml
+        --output-template-file packaged.yaml
+        --s3-bucket ${SAM_BUCKET}
+        --s3-prefix ${STACK_NAME}
+      - echo "Deploying SAM application..."
+      - >
+        sam deploy
+        --template-file packaged.yaml
+        --stack-name ${STACK_NAME}-${ENVIRONMENT}
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
+        --parameter-overrides Environment=${ENVIRONMENT}
+        --no-confirm-changeset
+        --no-fail-on-empty-changeset
+        --tags
+          Project=core-data-api
+          Environment=${ENVIRONMENT}
+
+artifacts:
+  type: zip
+  files:
+    - packaged.yaml
+    - template.yaml
+
+cache:
+  paths:
+    - "/root/.cache/pip/**/*"
+    - ".aws-sam/**/*"

@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Batch File Ingestion Pipeline.
+  Triggered via S3 ObjectCreated event on landing bucket at inbound/feeds/.
+  Probes fixed-width file, chunks it, and distributed-maps chunks to worker Lambdas
+  which parse and batch-write records into the raw-records DynamoDB table.
+  Aggregates chunk executions and emits the terminal End_Of_File milestone record.
+
+# ──────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+
+  RowsPerChunk:
+    Type: Number
+    Default: 5000
+    Description: Number of rows each Worker Lambda processes per invocation.
+
+  LandingBucketName:
+    Type: String
+    Description: Existing shared Landing S3 bucket name.
+
+  InboundPrefix:
+    Type: String
+    Default: inbound/feeds/
+    Description: S3 key prefix where batch feeds are deposited.
+
+# ──────────────────────────────────────────────
+# Globals
+# ──────────────────────────────────────────────
+Globals:
+  Function:
+    CodeUri: src/
+    Runtime: python3.12
+    MemorySize: 512
+    Timeout: 300
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: file-ingestion-pipeline
+        POWERTOOLS_LOG_LEVEL: INFO
+        LOG_LEVEL: INFO
+        ENVIRONMENT: !Ref Environment
+    Layers:
+      - !ImportValue !Sub "${Environment}-PowertoolsLayerArn"
+
+# ──────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB Target Table: raw-records ──
+  LoadTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${Environment}-raw-records"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Landing S3 Bucket ──
+  LandingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref LandingBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: InboundFeedsRetention
+            Status: Enabled
+            Prefix: inbound/
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Custom Resource: Empty Landing Bucket on Teardown ──
+  EmptyLandingBucket:
+    Type: Custom::EmptyBucket
+    Properties:
+      ServiceToken: !ImportValue !Sub '${Environment}-EmptyBucketServiceToken'
+      BucketName: !Ref LandingBucket
+
+  # ── Probe Lambda ──
+  # Triggered via S3 event on landing bucket
+  ProbeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-file-probe"
+      Handler: probe_service.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          LOAD_BUCKET: !Ref LandingBucketName
+          ROWS_PER_CHUNK: !Ref RowsPerChunk
+          STATE_MACHINE_ARN: !Ref LoadStateMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:HeadObject
+              Resource: !Sub "arn:aws:s3:::${LandingBucketName}/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !Ref LoadStateMachine
+      Events:
+        LandingFileCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref LandingBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref InboundPrefix
+      Tags:
+        Environment: !Ref Environment
+
+  # ── Worker Lambda ──
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-file-worker"
+      Handler: worker_service.lambda_handler
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          TARGET_TABLE_NAME: !Ref LoadTable
+          LOAD_BUCKET: !Ref LandingBucketName
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${LandingBucketName}/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:BatchWriteItem
+                - dynamodb:PutItem
+              Resource: !GetAtt LoadTable.Arn
+      Tags:
+        Environment: !Ref Environment
+
+  # ── Completion Lambda ──
+  CompletionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-file-completion"
+      Handler: completion_service.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          TARGET_TABLE_NAME: !Ref LoadTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt LoadTable.Arn
+      Tags:
+        Environment: !Ref Environment
+
+  # ── Step Functions State Machine IAM Role ──
+  LoadStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-file-ingestion-sfn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ProbeFunction.Arn
+                  - !GetAtt WorkerFunction.Arn
+                  - !GetAtt CompletionFunction.Arn
+
+  # ── Step Functions State Machine ──
+  LoadStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${Environment}-file-ingestion-pipeline"
+      Role: !GetAtt LoadStateMachineRole.Arn
+      Type: STANDARD
+      DefinitionBody:
+        Comment: "Batch File Ingestion Pipeline – Probe -> Distributed Map over chunks -> Emit End_Of_File milestone"
+        StartAt: ProcessChunks
+        States:
+          ProcessChunks:
+            Type: Map
+            ItemsPath: "$.probe_result.chunks"
+            MaxConcurrency: 40
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: DISTRIBUTED
+                ExecutionType: STANDARD
+              StartAt: WorkerTask
+              States:
+                WorkerTask:
+                  Type: Task
+                  Resource: !GetAtt WorkerFunction.Arn
+                  End: true
+                  Retry:
+                    - ErrorEquals: ["States.ALL"]
+                      IntervalSeconds: 5
+                      MaxAttempts: 3
+                      BackoffRate: 2.0
+            ResultPath: "$.map_results"
+            Next: EmitCompletion
+
+          EmitCompletion:
+            Type: Task
+            Resource: !GetAtt CompletionFunction.Arn
+            Parameters:
+              "probe_result.$": "$.probe_result"
+              "map_results.$": "$.map_results"
+            ResultPath: "$.completion_result"
+            Next: Done
+
+          Done:
+            Type: Succeed
+
+  # ── Operational CloudWatch Alarms ──
+  StateMachineExecutionFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-file-ingestion-sfn-failed"
+      AlarmDescription: "Alert when the batch file ingestion Step Functions state machine execution fails"
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref LoadStateMachine
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  WorkerFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-file-worker-errors"
+      AlarmDescription: "Alert when Worker Lambda errors exceed threshold"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ProbeFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-file-probe-errors"
+      AlarmDescription: "Alert when Probe Lambda errors exceed threshold"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProbeFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ──────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────
+Outputs:
+  LoadTableName:
+    Description: DynamoDB table name for raw records
+    Value: !Ref LoadTable
+    Export:
+      Name: !Sub "${Environment}-RawRecordsTableName"
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref LoadStateMachine
+    Export:
+      Name: !Sub "${Environment}-FileIngestionStateMachineArn"
+
+  LandingBucketName:
+    Description: Landing S3 bucket name
+    Value: !Ref LandingBucket
+    Export:
+      Name: !Sub "${Environment}-LandingBucketName"
+
+  LandingBucketArn:
+    Description: Landing S3 bucket ARN
+    Value: !GetAtt LandingBucket.Arn
+    Export:
+      Name: !Sub "${Environment}-LandingBucketArn"

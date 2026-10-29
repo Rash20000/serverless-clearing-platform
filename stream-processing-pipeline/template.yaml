@@ -1,0 +1,363 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Stream Processing Pipeline Stack (Load & Report).
+  2-Function Event-Driven Architecture:
+  1. LoadFunction: DynamoDB Streams consumer listening to upstream raw-records table; enriches and writes to cache.report;
+     detects End_Of_File marker and records 'load-end' milestone in Jobs table.
+  2. ReportFunction: Invoked by Job Watcher on 'load-end'; exports daily CSV report to S3 archive and dispatches via Pinpoint.
+  Uses Custom::StreamArnFetcher for dynamic stream discovery and Custom::ReportRegistrar for automated job cataloging.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+
+  AppName:
+    Type: String
+    Default: stream-processor
+
+  SourceTableName:
+    Type: String
+    Default: dev-raw-records
+    Description: Name of the upstream DynamoDB table producing stream events.
+
+  JobPrefix:
+    Type: String
+    Default: job-x
+
+  PinpointFromEmail:
+    Type: String
+    Default: "reports@example.com"
+    Description: Verified sender email address in Amazon Pinpoint / SES.
+
+  StreamBatchSize:
+    Type: Number
+    Default: 100
+    Description: Maximum number of records to retrieve from DynamoDB Streams in a single batch.
+
+  StreamBatchingWindowInSeconds:
+    Type: Number
+    Default: 10
+    Description: Batch window in seconds to wait and accumulate stream records before invoking Lambda (backpressure & efficiency).
+
+  StreamMaxRetryAttempts:
+    Type: Number
+    Default: 3
+    Description: Maximum number of retry attempts for failed stream batches before bisecting or routing to DLQ.
+
+  PythonRuntime:
+    Type: String
+    Default: python3.12
+
+  DefaultMemorySize:
+    Type: Number
+    Default: 512
+
+  DefaultTimeout:
+    Type: Number
+    Default: 300
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+
+# ---------------------------------------------------------------------------
+# Mappings — Environment to Consumer Emails
+# ---------------------------------------------------------------------------
+Mappings:
+  EnvironmentToEmailMap:
+    dev:
+      Recipients: "developer@example.com"
+    qa:
+      Recipients: "developer@example.com,qa@example.com"
+    uat:
+      Recipients: "trading-uat@example.com,business-uat@example.com"
+    prod:
+      Recipients: "trading@example.com,business@example.com,support@example.com"
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    CodeUri: src/
+    Runtime: !Ref PythonRuntime
+    MemorySize: !Ref DefaultMemorySize
+    Timeout: !Ref DefaultTimeout
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: !Ref AppName
+        POWERTOOLS_LOG_LEVEL: !Ref LogLevel
+        ENVIRONMENT: !Ref Environment
+    Layers:
+      - !ImportValue !Sub "${Environment}-PowertoolsLayerArn"
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── SSM Parameter Store: Distribution List ──
+  ReportRecipientsParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/${AppName}/config/report-recipients"
+      Type: String
+      Description: Plain-text distribution list for report consumers based on environment
+      Value: !FindInMap [EnvironmentToEmailMap, !Ref Environment, Recipients]
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref AppName
+
+  # ── Custom Resource 1: Dynamic Stream ARN Discovery ──
+  SourceStreamArnLookup:
+    Type: Custom::StreamArnFetcher
+    Properties:
+      ServiceToken: !ImportValue !Sub '${Environment}-StreamArnFetcherServiceToken'
+      TableName: !Ref SourceTableName
+
+  # ── SQS Dead Letter Queue for Stream Failures (Poison-Pill Isolation) ──
+  StreamProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-${AppName}-stream-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days retention for inspection & redrive
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref AppName
+
+  # ── Function 1: Load Consumer Service ──
+  LoadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AppName}-load"
+      Handler: load_consumer_service.lambda_handler
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          REFERENCE_TABLE_NAME: !ImportValue !Sub '${Environment}-ReferenceTableName'
+          CACHE_REPORT_TABLE_NAME: !ImportValue !Sub '${Environment}-CacheReportTableName'
+          JOBS_TABLE_NAME: !ImportValue !Sub '${Environment}-JobsTableName'
+          JOB_PREFIX: !Ref JobPrefix
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:BatchWriteItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-cache-report"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-cache-report/index/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-jobs"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeTable
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-reference"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-reference/index/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource: !GetAtt SourceStreamArnLookup.StreamArn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt StreamProcessingDLQ.Arn
+      Events:
+        SourceTableStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt SourceStreamArnLookup.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: !Ref StreamBatchSize
+            MaximumBatchingWindowInSeconds: !Ref StreamBatchingWindowInSeconds
+            MaximumRetryAttempts: !Ref StreamMaxRetryAttempts
+            BisectBatchOnFunctionError: true
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt StreamProcessingDLQ.Arn
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref AppName
+
+  # ── Function 2: Report Generation Service ──
+  # Invoked asynchronously by Job Watcher on 'load-end'. Emits 'report-end' upon completion.
+  ReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AppName}-report"
+      Handler: report_service.lambda_handler
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          CACHE_REPORT_TABLE_NAME: !ImportValue !Sub '${Environment}-CacheReportTableName'
+          ARCHIVE_BUCKET_NAME: !ImportValue !Sub '${Environment}-SharedArchiveBucketName'
+          JOBS_TABLE_NAME: !ImportValue !Sub '${Environment}-JobsTableName'
+          JOB_PREFIX: !Ref JobPrefix
+          EMAIL_SSM_PARAM_NAME: !Ref ReportRecipientsParameter
+          PINPOINT_APP_ID: !ImportValue !Sub '${Environment}-SharedPinpointAppId'
+          PINPOINT_FROM_EMAIL: !Ref PinpointFromEmail
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:GetItem
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-cache-report"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-cache-report/index/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Environment}-jobs"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+                - s3:AbortMultipartUpload
+              Resource:
+                - !Sub "arn:aws:s3:::${Environment}-archive-${AWS::AccountId}"
+                - !Sub "arn:aws:s3:::${Environment}-archive-${AWS::AccountId}/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ReportRecipientsParameter}"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - mobiletargeting:SendMessages
+              Resource: !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${Environment}-shared-pinpoint*"
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref AppName
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref AppName
+
+  # ── Custom Resource 2: Register report job in Job Catalog ──
+  ReportJobRegistration:
+    Type: Custom::ReportRegistrar
+    Properties:
+      ServiceToken: !ImportValue !Sub '${Environment}-ReportRegistrarServiceToken'
+      JobsTableName: !ImportValue !Sub '${Environment}-JobsTableName'
+      JobId: daily-summary-report
+      ReportFunctionArn: !GetAtt ReportFunction.Arn
+      Description: "Daily Summary Report Processing Job"
+      RegisteredAt: !Sub "${Environment}"
+
+  # ── Operational CloudWatch Alarms ──
+  LoadFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-${AppName}-load-errors"
+      AlarmDescription: "Alert when Load consumer encounters stream processing errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LoadFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ReportFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-${AppName}-report-errors"
+      AlarmDescription: "Alert when Report generation Lambda encounters execution errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  StreamProcessingDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-${AppName}-stream-dlq-messages"
+      AlarmDescription: "Alert when messages land in Stream Processing Dead Letter Queue (Poison-pill failure)"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt StreamProcessingDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  LoadFunctionArn:
+    Description: ARN of the Load Lambda (listens to stream)
+    Value: !GetAtt LoadFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-LoadFunctionArn"
+
+  ReportFunctionArn:
+    Description: ARN of the Report Lambda (invoked by Job Monitor)
+    Value: !GetAtt ReportFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-ReportFunctionArn"
+
+  StreamProcessingDLQArn:
+    Description: ARN of the Dead Letter Queue for Stream Processing
+    Value: !GetAtt StreamProcessingDLQ.Arn
+    Export:
+      Name: !Sub "${Environment}-StreamProcessingDLQArn"
+
+  StreamProcessingDLQUrl:
+    Description: URL of the Dead Letter Queue for Stream Processing
+    Value: !Ref StreamProcessingDLQ
+    Export:
+      Name: !Sub "${Environment}-StreamProcessingDLQUrl"
+
+  DynamicStreamArn:
+    Description: Stream ARN fetched dynamically by Custom Resource for upstream table
+    Value: !GetAtt SourceStreamArnLookup.StreamArn

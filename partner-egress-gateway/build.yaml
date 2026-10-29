@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────
+#  build.yaml – CI/CD Pipeline for Partner Egress Gateway
+# ─────────────────────────────────────────────────────────────
+#  Designed for AWS CodeBuild / CodePipeline.
+#  Stages: Install → Lint → Test → SAM Build → SAM Package → SAM Deploy
+# ─────────────────────────────────────────────────────────────
+
+version: 0.2
+
+env:
+  parameter-store:
+    S3_ARTIFACT_BUCKET: /cicd/artifact-bucket
+    DEPLOY_ROLE_ARN: /cicd/deploy-role-arn
+  variables:
+    ENVIRONMENT: dev
+    AWS_DEFAULT_REGION: us-east-1
+    STACK_NAME: partner-egress-gateway
+    TEMPLATE_FILE: template.yaml
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.12"
+    commands:
+      - echo "──── Installing dependencies ────"
+      - pip install --upgrade pip
+      - pip install aws-sam-cli
+      - pip install -r requirements-dev.txt 2>/dev/null || true
+
+  pre_build:
+    commands:
+      - echo "──── Linting ────"
+      - pip install ruff
+      - ruff check src/ --select E,W,F,I --ignore E501
+      - echo "──── Running unit tests ────"
+      - python -m unittest discover tests -v
+
+  build:
+    commands:
+      - echo "──── SAM Build ────"
+      - sam build --template-file ${TEMPLATE_FILE} --use-container --parallel
+
+  post_build:
+    commands:
+      - echo "──── SAM Package ────"
+      - >
+        sam package
+        --template-file .aws-sam/build/template.yaml
+        --output-template-file packaged.yaml
+        --s3-bucket ${S3_ARTIFACT_BUCKET}
+        --s3-prefix ${STACK_NAME}/${ENVIRONMENT}
+      - echo "──── SAM Deploy ────"
+      - >
+        sam deploy
+        --template-file packaged.yaml
+        --stack-name ${STACK_NAME}-${ENVIRONMENT}
+        --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND
+        --parameter-overrides Environment=${ENVIRONMENT}
+        --role-arn ${DEPLOY_ROLE_ARN}
+        --no-fail-on-empty-changeset
+        --tags
+          Project=OutboundGateway
+          Environment=${ENVIRONMENT}
+          ManagedBy=SAM
+      - echo "──── Deploy Complete ────"
+
+artifacts:
+  type: zip
+  files:
+    - packaged.yaml
+    - template.yaml
+
+cache:
+  paths:
+    - /root/.cache/pip/**/*
+    - .aws-sam/**/*

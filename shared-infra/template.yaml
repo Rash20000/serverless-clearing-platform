@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Shared Infrastructure Stack: Foundational S3 Archive Bucket, DynamoDB Tables (cache.report, reference),
+  and Amazon Pinpoint Application.
+  Account-level shared resources across ingestion, reporting, and archiving pipelines.
+  Integrates with Custom::EmptyBucket for clean teardown and enforces SSL-only transport.
+
+# ─────────────────────────────────────────────
+#  Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+
+  EnablePinpoint:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable Amazon Pinpoint application for alert dispatches.
+
+# ─────────────────────────────────────────────
+#  Conditions
+# ─────────────────────────────────────────────
+Conditions:
+  CreatePinpointApp: !Equals [!Ref EnablePinpoint, "true"]
+
+# ─────────────────────────────────────────────
+#  Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── Shared S3 Archive Bucket ──
+  SharedArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${Environment}-archive-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveGlacierTransition
+            Status: Enabled
+            Prefix: archive/
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── S3 Enforce TLS / HTTPS Only Bucket Policy ──
+  SharedArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SharedArchiveBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnforceTlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SharedArchiveBucket.Arn
+              - !Sub "${SharedArchiveBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ── Custom Resource: EmptyBucket cleaner on Stack Teardown ──
+  EmptySharedArchiveBucket:
+    Type: Custom::EmptyBucket
+    Properties:
+      ServiceToken: !ImportValue !Sub '${Environment}-EmptyBucketServiceToken'
+      BucketName: !Ref SharedArchiveBucket
+
+  # ── Shared Cache Report DynamoDB Table ──
+  SharedCacheReportTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${Environment}-cache-report"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── Shared Reference DynamoDB Table ──
+  SharedReferenceTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${Environment}-reference"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ── Shared Pinpoint Application ──
+  SharedPinpointApp:
+    Type: AWS::Pinpoint::App
+    Condition: CreatePinpointApp
+    Properties:
+      Name: !Sub "${Environment}-shared-pinpoint"
+      Tags:
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+  # ── Custom Resource Helper Layer ──
+  CrHelperLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${Environment}-crhelper-layer"
+      Description: CloudFormation Custom Resource Helper (crhelper) library
+      ContentUri: layers/crhelper/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+
+  CrHelperLayerParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/shared-infra/CrHelperLayerArn"
+      Type: String
+      Value: !Ref CrHelperLayer
+      Description: ARN of crhelper Lambda Layer
+      Tags:
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+
+
+
+  # ── SSM Parameter Store: Layer ARNs ──
+  PowertoolsLayerParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${Environment}/shared-infra/PowertoolsLayerArn"
+      Type: String
+      Value: !Sub "arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:7"
+      Description: ARN of AWS Lambda Powertools Layer for Python
+      Tags:
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+
+
+
+# ─────────────────────────────────────────────
+#  Outputs & Exports
+# ─────────────────────────────────────────────
+Outputs:
+  SharedArchiveBucketName:
+    Description: Name of the shared S3 Archive bucket
+    Value: !Ref SharedArchiveBucket
+    Export:
+      Name: !Sub "${Environment}-SharedArchiveBucketName"
+
+  SharedArchiveBucketArn:
+    Description: ARN of the shared S3 Archive bucket
+    Value: !GetAtt SharedArchiveBucket.Arn
+    Export:
+      Name: !Sub "${Environment}-SharedArchiveBucketArn"
+
+  CacheReportTableName:
+    Description: Name of the shared Cache Report DynamoDB table
+    Value: !Ref SharedCacheReportTable
+    Export:
+      Name: !Sub "${Environment}-CacheReportTableName"
+
+  CacheReportTableArn:
+    Description: ARN of the shared Cache Report DynamoDB table
+    Value: !GetAtt SharedCacheReportTable.Arn
+    Export:
+      Name: !Sub "${Environment}-CacheReportTableArn"
+
+  ReferenceTableName:
+    Description: Name of the shared Reference DynamoDB table
+    Value: !Ref SharedReferenceTable
+    Export:
+      Name: !Sub "${Environment}-ReferenceTableName"
+
+  ReferenceTableArn:
+    Description: ARN of the shared Reference DynamoDB table
+    Value: !GetAtt SharedReferenceTable.Arn
+    Export:
+      Name: !Sub "${Environment}-ReferenceTableArn"
+
+  SharedPinpointAppId:
+    Description: ID of the shared Amazon Pinpoint application
+    Condition: CreatePinpointApp
+    Value: !Ref SharedPinpointApp
+    Export:
+      Name: !Sub "${Environment}-SharedPinpointAppId"
+
+  SharedPinpointAppArn:
+    Description: ARN of the shared Amazon Pinpoint application
+    Condition: CreatePinpointApp
+    Value: !GetAtt SharedPinpointApp.Arn
+    Export:
+      Name: !Sub "${Environment}-SharedPinpointAppArn"
+
+  PowertoolsLayerArn:
+    Description: ARN of AWS Lambda Powertools Layer for Python
+    Value: !Sub "arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:7"
+    Export:
+      Name: !Sub "${Environment}-PowertoolsLayerArn"
+
+  CrHelperLayerArn:
+    Description: ARN of crhelper Lambda Layer
+    Value: !Ref CrHelperLayer
+    Export:
+      Name: !Sub "${Environment}-CrHelperLayerArn"
+
+

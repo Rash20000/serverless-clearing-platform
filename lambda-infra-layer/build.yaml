@@ -1,0 +1,52 @@
+version: 0.2
+
+env:
+  variables:
+    STACK_NAME: "lambda-infra-layer"
+    AWS_REGION: "us-east-1"
+    ENVIRONMENT: "dev"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.12"
+    commands:
+      - echo "Installing build tools..."
+      - pip install --upgrade pip
+      - pip install aws-sam-cli
+
+  pre_build:
+    commands:
+      - echo "Running template validation tests..."
+      - python -m unittest discover tests -v
+
+  build:
+    commands:
+      - echo "Building Lambda layers for ARM64 Python 3.12..."
+      - echo "1. Building Pandas Layer..."
+      - pip install --only-binary=:all: --platform manylinux2014_aarch64 --implementation cp --python-version 312 -r layers/pandas/requirements.txt -t layers/pandas/python
+      - echo "2. Building OpenPyXL Layer..."
+      - pip install --only-binary=:all: --platform manylinux2014_aarch64 --implementation cp --python-version 312 -r layers/openpyxl/requirements.txt -t layers/openpyxl/python
+      - echo "3. Building CrHelper Layer..."
+      - pip install -r layers/crhelper/requirements.txt -t layers/crhelper/python
+      - echo "Validating CloudFormation template..."
+      - sam validate --template-file template.yaml
+
+  post_build:
+    commands:
+      - echo "Deploying Lambda Infrastructure Layers..."
+      - |
+        sam deploy \
+          --template-file template.yaml \
+          --stack-name "${ENVIRONMENT}-${STACK_NAME}" \
+          --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+          --parameter-overrides "Environment=${ENVIRONMENT}" \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset \
+          --region "${AWS_REGION}"
+      - echo "Lambda Infrastructure Layers deployment complete."
+
+artifacts:
+  type: zip
+  files:
+    - template.yaml

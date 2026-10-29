@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Core Data API Gateway & Microservices.
+  Provides external and internal REST API endpoints.
+  Implements 1 Lambda per API endpoint pattern:
+    - POST /v1/account/inquiry -> AccountInquiryFunction (Tier-1 Critical: Provisioned Concurrency via Alias)
+    - GET /v1/activity/{account_id} -> ActivityLookupFunction (Tier-2: Trading Hours Warm-Up)
+    - GET /v1/pages/{account_id} -> PagesLookupFunction (Tier-2: Trading Hours Warm-Up)
+  Includes:
+    - Structured AccessLogSetting format pattern
+    - CloudWatch Alarms for API 5XX / 4XX errors
+    - Directly attached policies on Lambda execution roles
+
+# ─────────────────────────────────────────────────────────
+# Parameters (SSM / CloudFormation driven)
+# ─────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+    Description: Deployment environment tag.
+
+  AccountInquiryMinProvisionedConcurrency:
+    Type: Number
+    Default: 2
+    Description: Minimum provisioned concurrency for Account Inquiry service.
+
+  AccountInquiryMaxProvisionedConcurrency:
+    Type: Number
+    Default: 20
+    Description: Maximum provisioned concurrency for Account Inquiry service under auto-scaling.
+
+  CacheAccountTableName:
+    Type: String
+    Default: cache.account
+    Description: DynamoDB table name for account cache.
+
+  CacheActivityTableName:
+    Type: String
+    Default: cache.activity
+    Description: DynamoDB table name for activity cache.
+
+  CachePagesTableName:
+    Type: String
+    Default: cache.pages
+    Description: DynamoDB table name for pages cache.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+
+# ─────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────
+Globals:
+  Function:
+    CodeUri: src/
+    Runtime: python3.12
+    MemorySize: 512
+    Timeout: 30
+    Tracing: Active
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: core-data-api
+        POWERTOOLS_LOG_LEVEL: !Ref LogLevel
+        EVENT_BUS_NAME: !Ref InboundLoggingBus
+        CACHE_ACCOUNT_TABLE: !Ref CacheAccountTableName
+        CACHE_ACTIVITY_TABLE: !Ref CacheActivityTableName
+        CACHE_PAGES_TABLE: !Ref CachePagesTableName
+        OUTBOUND_API_GATEWAY_URL: !ImportValue OutboundApiGatewayExecuteEndpointUrl
+    Layers:
+      - !ImportValue !Sub "${Environment}-PowertoolsLayerArn"
+
+# ─────────────────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────────────────
+Resources:
+
+  # ── REST API Gateway ──────────────────────────────────
+  InboundApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${Environment}-core-data-api"
+      StageName: !Ref Environment
+      TracingEnabled: true
+      OpenApiVersion: "3.0.3"
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationLatency":"$context.integrationLatency","responseLatency":"$context.responseLatency"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: INFO
+          ThrottlingBurstLimit: 500
+          ThrottlingRateLimit: 1000
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${Environment}-core-data-api"
+      RetentionInDays: 30
+
+  # ── EventBridge Logging Bus ───────────────────────────
+  InboundLoggingBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${Environment}-core-data-logging-bus"
+
+  # ─────────────────────────────────────────────────────
+  # Endpoint 1: POST /v1/account/inquiry -> AccountInquiryFunction
+  # Tier-1 Critical: Uses PROVISIONED CONCURRENCY via live alias
+  # ─────────────────────────────────────────────────────
+  AccountInquiryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-account-inquiry"
+      Handler: account_service.lambda_handler
+      Description: Inbound API endpoint - POST /v1/account/inquiry (Tier-1 Critical: Provisioned Concurrency)
+      AutoPublishAlias: live
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: !Ref AccountInquiryMinProvisionedConcurrency
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:BatchGetItem
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CacheAccountTableName}*"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CacheActivityTableName}*"
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !GetAtt InboundLoggingBus.Arn
+      Events:
+        AccountInquiryApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InboundApi
+            Path: /v1/account/inquiry
+            Method: POST
+      Tags:
+        Environment: !Ref Environment
+        Tier: Critical
+
+  # Auto Scaling: Register Scalable Target for Lambda Provisioned Concurrency
+  AccountInquiryScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: AccountInquiryFunctionAliaslive
+    Properties:
+      ServiceNamespace: lambda
+      ScalableDimension: lambda:function:ProvisionedConcurrency
+      ResourceId: !Sub "function:${AccountInquiryFunction}:live"
+      MinCapacity: !Ref AccountInquiryMinProvisionedConcurrency
+      MaxCapacity: !Ref AccountInquiryMaxProvisionedConcurrency
+      RoleARN: !Sub "arn:aws:iam:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/lambda.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_LambdaProvisionedConcurrency"
+
+  # Auto Scaling: Target Tracking Policy on Provisioned Concurrency Utilization (70%)
+  AccountInquiryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${Environment}-account-inquiry-concurrency-utilization"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AccountInquiryScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 0.70
+        PredefinedMetricSpecification:
+          PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 0
+
+  # ─────────────────────────────────────────────────────
+  # Endpoint 2: GET /v1/activity/{account_id} -> ActivityLookupFunction
+  # Tier-2: Uses Cost-Optimized Trading Hours Warm-Up Schedule
+  # ─────────────────────────────────────────────────────
+  ActivityLookupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-activity-lookup"
+      Handler: activity_service.lambda_handler
+      Description: Inbound API endpoint - GET /v1/activity/{account_id} (Tier-2: Trading Hours Warmup)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CacheActivityTableName}*"
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !GetAtt InboundLoggingBus.Arn
+      Events:
+        ActivityLookupApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InboundApi
+            Path: /v1/activity/{account_id}
+            Method: GET
+        # Trading Hours Warm-Up: Mon-Fri every 5 minutes from 8am to 4pm EST (13:00 - 21:00 UTC)
+        TradingHoursWarmup:
+          Type: Schedule
+          Properties:
+            Schedule: cron(*/5 13-20 ? * MON-FRI *)
+            Description: Warms container every 5 mins during trading hours
+            Input: '{"action":"warmup","source":"aws.events"}'
+            Enabled: true
+      Tags:
+        Environment: !Ref Environment
+        Tier: Standard
+
+  # ─────────────────────────────────────────────────────
+  # Endpoint 3: GET /v1/pages/{account_id} -> PagesLookupFunction
+  # Tier-2: Uses Cost-Optimized Trading Hours Warm-Up Schedule
+  # ─────────────────────────────────────────────────────
+  PagesLookupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-pages-lookup"
+      Handler: pages_service.lambda_handler
+      Description: Inbound API endpoint - GET /v1/pages/{account_id} (Tier-2: Trading Hours Warmup)
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${CachePagesTableName}*"
+      Events:
+        PagesLookupApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref InboundApi
+            Path: /v1/pages/{account_id}
+            Method: GET
+        # Trading Hours Warm-Up: Mon-Fri every 5 minutes from 8am to 4pm EST (13:00 - 21:00 UTC)
+        TradingHoursWarmup:
+          Type: Schedule
+          Properties:
+            Schedule: cron(*/5 13-20 ? * MON-FRI *)
+            Description: Warms container every 5 mins during trading hours
+            Input: '{"action":"warmup","source":"aws.events"}'
+            Enabled: true
+      Tags:
+        Environment: !Ref Environment
+        Tier: Standard
+
+  # ─────────────────────────────────────────────────────
+  # CloudWatch Alarms for API Gateway (5XX & 4XX Thresholds)
+  # ─────────────────────────────────────────────────────
+  Api5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-core-data-api-5xx-errors"
+      AlarmDescription: Triggers if API Gateway returns >= 10 5XX server errors within 1 minute
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${Environment}-core-data-api"
+        - Name: Stage
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Api4xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-core-data-api-4xx-errors"
+      AlarmDescription: Triggers if API Gateway returns high volume of 4XX client errors (>= 50 in 1 minute)
+      Namespace: AWS/ApiGateway
+      MetricName: 4XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${Environment}-core-data-api"
+        - Name: Stage
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────────────────
+Outputs:
+  InboundApiUrl:
+    Description: Core Data Inbound API Gateway base URL.
+    Value: !Sub "https://${InboundApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${Environment}-CoreDataApiUrl"
+
+  InboundLoggingBusArn:
+    Description: ARN of the Inbound Logging EventBridge Bus.
+    Value: !GetAtt InboundLoggingBus.Arn
+    Export:
+      Name: !Sub "${Environment}-CoreDataLoggingBusArn"
+
+  AccountInquiryFunctionArn:
+    Description: ARN of AccountInquiryFunction (live alias with provisioned concurrency).
+    Value: !Ref AccountInquiryFunction.Alias
+
+  ActivityLookupFunctionArn:
+    Description: ARN of ActivityLookupFunction.
+    Value: !GetAtt ActivityLookupFunction.Arn
+
+  PagesLookupFunctionArn:
+    Description: ARN of PagesLookupFunction.
+    Value: !GetAtt PagesLookupFunction.Arn

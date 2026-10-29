@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Job Service Stack.
+  Provisions the shared Jobs DynamoDB Table (with stream), the Job Watcher Lambda service,
+  and the ReportRegistrar Custom Resource for dynamic job registration.
+  Manages asynchronous job choreography, status monitoring, and alert notifications.
+
+# ──────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, qa, uat, prod]
+
+  ServiceName:
+    Type: String
+    Default: job-service
+
+# ──────────────────────────────────────────────
+# Mappings
+# ──────────────────────────────────────────────
+Mappings:
+  EnvironmentToConfigMap:
+    dev:
+      SupportEmail: "dev-alerts@example.com"
+      FromEmail: "no-reply-dev@example.com"
+    qa:
+      SupportEmail: "qa-alerts@example.com"
+      FromEmail: "no-reply-qa@example.com"
+    uat:
+      SupportEmail: "uat-alerts@example.com"
+      FromEmail: "no-reply-uat@example.com"
+    prod:
+      SupportEmail: "support-team@example.com"
+      FromEmail: "support-alerts@example.com"
+
+# ──────────────────────────────────────────────
+# Globals
+# ──────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+    Architectures: [arm64]
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: !Ref ServiceName
+        POWERTOOLS_LOG_LEVEL: INFO
+        LOG_LEVEL: INFO
+        ENVIRONMENT: !Ref Environment
+    Layers:
+      - !ImportValue !Sub "${Environment}-PowertoolsLayerArn"
+
+# ──────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────
+Resources:
+
+  # ── Shared Jobs DynamoDB Table ──
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${Environment}-jobs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: !Ref ServiceName
+
+  # ── Custom Resource Lambda: ReportRegistrar ──
+  ReportRegistrarFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-report-registrar"
+      Handler: report_registrar.lambda_handler
+      CodeUri: src/
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt JobsTable.Arn
+      Tags:
+        Environment: !Ref Environment
+        Service: !Ref ServiceName
+
+  # ── Job Watcher Service Lambda ──
+  JobWatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-job-watcher"
+      Handler: job_watcher.lambda_handler
+      CodeUri: src/
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          JOBS_TABLE_NAME: !Ref JobsTable
+          PINPOINT_APP_ID: !ImportValue !Sub '${Environment}-SharedPinpointAppId'
+          SUPPORT_EMAIL: !FindInMap [EnvironmentToConfigMap, !Ref Environment, SupportEmail]
+          PINPOINT_FROM_EMAIL: !FindInMap [EnvironmentToConfigMap, !Ref Environment, FromEmail]
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+              Resource: !GetAtt JobsTable.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - mobiletargeting:SendMessages
+              Resource: !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/*"
+      Events:
+        JobsStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt JobsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 2
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+      Tags:
+        Environment: !Ref Environment
+        Service: !Ref ServiceName
+
+  # ── Operational CloudWatch Alarms ──
+  JobWatcherErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-job-watcher-errors"
+      AlarmDescription: "Alert when Job Watcher encounters execution errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref JobWatcherFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ReportRegistrarErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-report-registrar-errors"
+      AlarmDescription: "Alert when ReportRegistrar custom resource encounters execution errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReportRegistrarFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ──────────────────────────────────────────────
+# Outputs & Exports
+# ──────────────────────────────────────────────
+Outputs:
+  JobsTableName:
+    Description: Name of the shared Jobs DynamoDB Table
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub "${Environment}-JobsTableName"
+
+  JobsTableArn:
+    Description: ARN of the shared Jobs DynamoDB Table
+    Value: !GetAtt JobsTable.Arn
+    Export:
+      Name: !Sub "${Environment}-JobsTableArn"
+
+  JobsTableStreamArn:
+    Description: Stream ARN of the shared Jobs DynamoDB Table
+    Value: !GetAtt JobsTable.StreamArn
+    Export:
+      Name: !Sub "${Environment}-JobsTableStreamArn"
+
+  ReportRegistrarServiceToken:
+    Description: Service Token ARN for Custom::ReportRegistrar
+    Value: !GetAtt ReportRegistrarFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-ReportRegistrarServiceToken"
+
+  JobWatcherFunctionArn:
+    Description: ARN of the Job Watcher Service Lambda
+    Value: !GetAtt JobWatcherFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-JobWatcherFunctionArn"
